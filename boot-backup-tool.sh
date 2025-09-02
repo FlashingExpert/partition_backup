@@ -369,6 +369,250 @@ restore_partition() {
     echo -e "✅ Restore completed successfully: $TARGET" | tee -a "$LOGFILE"
 }
 
+# === Full Disk Backup (including bootloader) ===
+
+FULL_DISK_MAX_BACKUPS="${FULL_DISK_MAX_BACKUPS:-5}"   # rotation for disk images
+
+get_disk_compression_ext() {
+    case "$COMPRESSION_ALGO" in
+        zstd) echo "img.zst" ;;
+        gzip) echo "img.gz" ;;
+        xz)   echo "img.xz" ;;
+        *)    echo "img" ;;
+    esac
+}
+
+get_disk_compression_cmd() {
+    case "$COMPRESSION_ALGO" in
+        zstd) echo "zstd $(get_compression_args) -T0 -v -o" ;;
+        gzip) echo "gzip $(get_compression_args) -c >" ;;
+        xz)   echo "xz $(get_compression_args) -c >" ;;
+    esac
+}
+
+select_disk() {
+    echo -e "\n\033[1;34m>>> Select WHOLE DISK to back up (NOT a partition) <<<\033[0m"
+    # List whole disks only
+    lsblk -dnpo NAME,SIZE,TYPE,MODEL | awk '$3=="disk"{printf "%-20s %-8s %s\n",$1,$2,$4}'
+    read -rp "Enter disk device (e.g., /dev/sda or /dev/nvme0n1), or empty to cancel: " WHOLE_DISK
+    [[ -z "$WHOLE_DISK" ]] && { echo "Cancelled."; return 1; }
+
+    # Validate it's a disk device
+    if ! lsblk -dnpo NAME,TYPE | awk '$2=="disk"{print $1}' | grep -qx "$WHOLE_DISK"; then
+        echo "❌ '$WHOLE_DISK' is not a whole-disk device."
+        return 1
+    fi
+
+    # Warn if any partitions are mounted
+    if lsblk -nrpo MOUNTPOINT "$WHOLE_DISK" | grep -q '/'; then
+        echo "⚠️ One or more partitions on $WHOLE_DISK are mounted:"
+        lsblk -nrpo NAME,MOUNTPOINT "$WHOLE_DISK" | awk '$2!=""{print " - "$1" -> "$2}'
+        read -rp "Please unmount them first. Type 'OVERRIDE' to continue anyway: " OV
+        [[ "$OV" != "OVERRIDE" ]] && { echo "Aborted."; return 1; }
+    fi
+
+    SELECTED_DISK="$WHOLE_DISK"
+    echo "✅ Selected disk: $SELECTED_DISK"
+}
+
+ensure_disk_backup_dir() {
+    # Create a sibling 'disk_backup' under the chosen BACKUP_DIR root
+    BACKUP_ROOT="${BACKUP_DIR%/}"
+    DISK_BACKUP_DIR="$BACKUP_ROOT/disk_backup"
+    mkdir -p "$DISK_BACKUP_DIR"
+    echo "📁 Disk backup directory: $DISK_BACKUP_DIR"
+}
+
+full_disk_backup() {
+    if [[ -z "${SELECTED_DISK:-}" ]]; then
+        echo "⚠️ No disk selected. Run 'select_disk' first."
+        return 1
+    fi
+
+    ensure_disk_backup_dir
+
+    DATE=$(date +"%Y-%m-%d_%H-%M-%S")
+    SAFE_DISK=$(echo "$SELECTED_DISK" | tr '/' '_')
+    EXT=$(get_disk_compression_ext)
+    BASENAME="${SAFE_DISK}-${DATE}"
+    IMAGE="$DISK_BACKUP_DIR/${BASENAME}.${EXT}"
+    CHECKSUM="$DISK_BACKUP_DIR/${BASENAME}.sha256"
+    SIGNATURE="$DISK_BACKUP_DIR/${BASENAME}.sig"
+    LOGFILE="$DISK_BACKUP_DIR/full-disk-backup.log"
+
+    # Reports (helpful for restore/migration)
+    REPORT_DIR="$DISK_BACKUP_DIR/${BASENAME}_reports"
+    mkdir -p "$REPORT_DIR"
+
+    echo -e "\033[1;36m[$DATE] 🧰 Full-disk backup: $SELECTED_DISK using $COMPRESSION_ALGO ($COMPRESSION_PRESET)\033[0m" | tee -a "$LOGFILE"
+
+    # Export partition table & metadata (text)
+    sudo sfdisk -d "$SELECTED_DISK" > "$REPORT_DIR/partition-table.sfdisk" 2>/dev/null || true
+    lsblk -e7 -o NAME,TYPE,SIZE,FSTYPE,LABEL,UUID,MOUNTPOINT > "$REPORT_DIR/lsblk.txt" 2>/dev/null || true
+    blkid > "$REPORT_DIR/blkid.txt" 2>/dev/null || true
+    command -v efibootmgr >/dev/null && efibootmgr -v > "$REPORT_DIR/efibootmgr.txt" 2>/dev/null || true
+    command -v sgdisk >/dev/null && sudo sgdisk --backup="$REPORT_DIR/gpt-backup.bin" "$SELECTED_DISK" 2>/dev/null || true
+    command -v mdadm  >/dev/null && sudo mdadm --detail --scan > "$REPORT_DIR/mdadm.conf" 2>/dev/null || true
+
+    SIZE=$(sudo blockdev --getsize64 "$SELECTED_DISK")
+    echo "📏 Disk size: $(numfmt --to=iec "$SIZE")"
+
+    echo "❗ This will READ the entire disk. To proceed, type the disk again: $SELECTED_DISK"
+    read -rp "> " CONFIRM_DISK
+    [[ "$CONFIRM_DISK" != "$SELECTED_DISK" ]] && { echo "Aborted."; return 1; }
+
+    START_TIME=$(date +%s)
+
+    # Stream + progress + compression
+    case "$COMPRESSION_ALGO" in
+        zstd)
+            if ! sudo dd if="$SELECTED_DISK" bs=16M iflag=fullblock status=progress 2>/dev/null | \
+                pv -s "$SIZE" -pterb --name "📀 Reading $SELECTED_DISK" | \
+                zstd $(get_compression_args) -T0 -v -o "$IMAGE"; then
+                echo -e "\033[1;31m❌ Full-disk backup failed (zstd).\033[0m" | tee -a "$LOGFILE"
+                return 1
+            fi
+            ;;
+        gzip)
+            if ! sudo dd if="$SELECTED_DISK" bs=16M iflag=fullblock status=progress 2>/dev/null | \
+                pv -s "$SIZE" -pterb --name "📀 Reading $SELECTED_DISK" | \
+                gzip $(get_compression_args) -c > "$IMAGE"; then
+                echo -e "\033[1;31m❌ Full-disk backup failed (gzip).\033[0m" | tee -a "$LOGFILE"
+                return 1
+            fi
+            ;;
+        xz)
+            if ! sudo dd if="$SELECTED_DISK" bs=16M iflag=fullblock status=progress 2>/dev/null | \
+                pv -s "$SIZE" -pterb --name "📀 Reading $SELECTED_DISK" | \
+                xz $(get_compression_args) -c > "$IMAGE"; then
+                echo -e "\033[1;31m❌ Full-disk backup failed (xz).\033[0m" | tee -a "$LOGFILE"
+                return 1
+            fi
+            ;;
+        *)
+            echo "❌ Unsupported compression algorithm: $COMPRESSION_ALGO"
+            return 1
+            ;;
+    esac
+
+    END_TIME=$(date +%s)
+    ELAPSED=$((END_TIME - START_TIME))
+    ELAPSED_HMS=$(printf '%02d:%02d:%02d\n' $((ELAPSED/3600)) $(((ELAPSED%3600)/60)) $((ELAPSED%60)))
+
+    if [ ! -f "$IMAGE" ]; then
+        echo -e "\033[1;31m❌ No image produced: $IMAGE\033[0m" | tee -a "$LOGFILE"
+        return 1
+    fi
+
+    FILESIZE=$(stat -c%s "$IMAGE")
+    HUMAN_SIZE=$(numfmt --to=iec "$FILESIZE")
+    RATIO=$(awk "BEGIN {printf \"%.2f\", $FILESIZE/$SIZE*100}")
+
+    echo -e "\033[1;32m[$DATE] ✅ Full-disk backup complete: $IMAGE\033[0m" | tee -a "$LOGFILE"
+    echo "📦 Compressed size: $HUMAN_SIZE ($FILESIZE bytes)" | tee -a "$LOGFILE"
+    echo "📊 Compression ratio: $RATIO%" | tee -a "$LOGFILE"
+    echo "⏱️ Elapsed: $ELAPSED_HMS" | tee -a "$LOGFILE"
+    echo "📝 Reports saved to: $REPORT_DIR" | tee -a "$LOGFILE"
+
+    sha256sum "$IMAGE" > "$CHECKSUM"
+    echo "🔐 Checksum: $CHECKSUM" | tee -a "$LOGFILE"
+
+    if [ "$GPG_SIGNING_ENABLED" = true ] && [ -n "$GPG_KEY_ID" ]; then
+        if gpg --local-user "$GPG_KEY_ID" --output "$SIGNATURE" --detach-sign "$IMAGE"; then
+            echo "🔏 GPG signature: $SIGNATURE" | tee -a "$LOGFILE"
+        else
+            echo "❌ GPG signing failed." | tee -a "$LOGFILE"
+        fi
+    fi
+
+    # Rotation
+    echo "🔁 Rotation (keep newest $FULL_DISK_MAX_BACKUPS)"
+    PREFIX="$SAFE_DISK-"
+    mapfile -t IMAGES < <(ls -1t "$DISK_BACKUP_DIR"/${PREFIX}*.${EXT} 2>/dev/null || true)
+    COUNT=${#IMAGES[@]}
+    if (( COUNT > FULL_DISK_MAX_BACKUPS )); then
+        for ((i=FULL_DISK_MAX_BACKUPS; i<COUNT; i++)); do
+            OLD="${IMAGES[$i]}"
+            echo "🗑️  Deleting old: $OLD"
+            rm -f "$OLD" "$OLD.sha256" "$OLD.sig"
+            rm -rf "${OLD%.*}_reports"
+        done
+    fi
+}
+
+restore_full_disk() {
+    ensure_disk_backup_dir
+    echo "🔍 Available full-disk images:"
+    mapfile -t IMAGES < <(ls -1t "$DISK_BACKUP_DIR"/*.img.zst "$DISK_BACKUP_DIR"/*.img.gz "$DISK_BACKUP_DIR"/*.img.xz 2>/dev/null || true)
+    [[ "${#IMAGES[@]}" -eq 0 ]] && { echo "❌ No images found."; return 1; }
+
+    for i in "${!IMAGES[@]}"; do
+        echo "$((i+1))) $(basename "${IMAGES[$i]}")"
+    done
+    read -rp "Select image to restore [1-${#IMAGES[@]}] (0 to cancel): " CH
+    [[ ! "$CH" =~ ^[0-9]+$ ]] && { echo "Cancelled."; return 1; }
+    (( CH == 0 )) && { echo "Cancelled."; return 0; }
+    (( CH < 1 || CH > ${#IMAGES[@]} )) && { echo "Invalid."; return 1; }
+
+    IMG="${IMAGES[$((CH-1))]}"
+    EXT="${IMG##*.}"
+    echo "Selected: $IMG"
+
+    # Optional checksum verify
+    if [ -f "${IMG}.sha256" ]; then
+        if ! sha256sum -c "${IMG}.sha256"; then
+            echo "❌ Checksum failed; aborting."
+            return 1
+        fi
+    fi
+
+    # Target disk confirm
+    lsblk -dnpo NAME,SIZE,TYPE,MODEL | awk '$3=="disk"{printf "%-20s %-8s %s\n",$1,$2,$4}'
+    read -rp "⚠️ Target WHOLE DISK to overwrite (e.g., /dev/sda): " TARGET_DISK
+    if ! lsblk -dnpo NAME,TYPE | awk '$2=="disk"{print $1}' | grep -qx "$TARGET_DISK"; then
+        echo "❌ Not a disk: $TARGET_DISK"
+        return 1
+    fi
+    echo "This will destroy ALL data on $TARGET_DISK. Type 'I UNDERSTAND' to proceed:"
+    read -r CONFIRM
+    [[ "$CONFIRM" != "I UNDERSTAND" ]] && { echo "Aborted."; return 1; }
+
+    # Restore stream with progress
+    case "$EXT" in
+        zst)  zstd -d "$IMG" -c | sudo dd of="$TARGET_DISK" bs=16M conv=fsync status=progress ;;
+        gz)   gunzip -c "$IMG"   | sudo dd of="$TARGET_DISK" bs=16M conv=fsync status=progress ;;
+        xz)   unxz -c "$IMG"     | sudo dd of="$TARGET_DISK" bs=16M conv=fsync status=progress ;;
+        *)    echo "❌ Unsupported format: $EXT"; return 1 ;;
+    esac
+    sync
+    echo "✅ Full-disk restore complete. You may need to reconfigure UEFI boot order (see saved efibootmgr.txt)."
+}
+
+# === Menu hooks (add to your main menu) ===
+full_disk_menu() {
+    while true; do
+        echo ""
+        echo "==== Full Disk Backup ===="
+        echo "Disk selected: ${SELECTED_DISK:-<none>}"
+        echo "Backup root:   ${BACKUP_DIR:-<unset>}"
+        echo "Compression:   $COMPRESSION_ALGO ($COMPRESSION_PRESET)"
+        echo "---------------------------"
+        echo "1) Select disk"
+        echo "2) Run full-disk backup"
+        echo "3) Restore full-disk image"
+        echo "4) Show last reports folder"
+        echo "5) Back"
+        read -rp "Choose: " c
+        case "$c" in
+            1) select_disk ;;
+            2) full_disk_backup ;;
+            3) restore_full_disk ;;
+            4) ls -1dt "${DISK_BACKUP_DIR:-$BACKUP_DIR/disk_backup}"/*_reports 2>/dev/null | head -n1 ;;
+            5) break ;;
+            *) echo "Invalid." ;;
+        esac
+    done
+}
 # === Main Menu ===
 load_config
 
@@ -389,9 +633,10 @@ while true; do
     echo "6) Toggle GPG signing"
     echo "7) Set GPG key ID"
     echo "8) Set Backup Dir"
-    echo "9) Exit"
+    echo "9) backup whole drive"
+    echo "10) Exit"
     echo "------------------------------------"
-    read -p "Choose an option [1-9]: " CHOICE
+    read -p "Choose an option [1-10]: " CHOICE
 
     case "$CHOICE" in
         1) select_partition ;;
@@ -431,7 +676,8 @@ while true; do
             save_config
             ;;
         8) set_backup_dir ;;
-        9) echo "Bye!"; exit 0 ;;
+        9) full_disk_menu ;;
+        10) echo "Bye!"; exit 0 ;;
         *) echo "Invalid choice." ;;
     esac
 done
